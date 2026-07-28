@@ -1,233 +1,303 @@
 # Kimi K3 部署并行策略与资源估算
 
 > 分析日期: 2026-07-28
-> 数据来源: PR #12951、`KIMI_K3_SITU_QUANT_CONTRACT.md`、模型配置
+> 数据来源: ModelScope `moonshotai/Kimi-K3` config.json + PR #12951 + `KIMI_K3_SITU_QUANT_CONTRACT.md`
 
 ---
 
-## 一、模型规格
+## 一、模型规格（基于真实 config.json）
+
+### 1.1 核心超参
 
 | 参数 | 数值 |
-|---:|---:|
-| Hidden Size | 7168 |
-| Routed Expert Hidden Size | 3584 |
-| Routed Expert Intermediate Size | 3072 |
-| Routed Experts 总数 | 896 |
-| 每 Token 激活 Expert 数 (Top-K) | 16 |
-| Shared Experts | 2 |
-| Shared Intermediate Size | 6144 (2×3072) |
-| KDA Head Dim (K/V) | 128 |
-| SiTU Beta / Linear Beta | 4.0 / 25.0 |
-| 输入精度 | BF16 |
-| 推荐权重量化 | W4A8 (INT4 权重 + INT8/MXFP8 激活) |
+|---:|---|
+| `num_hidden_layers` | **93** |
+| `hidden_size` | 7168 |
+| `intermediate_size` (MLP) | 33792 |
+| `moe_intermediate_size` | 3072 |
+| `routed_expert_hidden_size` | 3584 |
+| `num_attention_heads` | **96** |
+| `num_key_value_heads` | 96 (GQA ratio 1:1) |
+| `vocab_size` | 163840 |
+| `q_lora_rank` | 1536 |
+| `kv_lora_rank` | 512 |
+| `qk_nope_head_dim` | 128 |
+| `qk_rope_head_dim` | 64 |
+| `v_head_dim` | 128 |
+| `max_position_embeddings` | 1048576 (1M) |
+| `dtype` | bfloat16 |
+| `hidden_act` | situ |
 
-> **注意**: HuggingFace 上发布的权重为 W4A8 量化版本（`Kimi-K3-Instruct-W4A8` 或类似命名），直接可用于部署。BF16 原始权重由于模型规模过大（总参数量估算 ~800B+），单卡/单节点无法部署。
+### 1.2 MoE 配置
+
+| 参数 | 数值 |
+|---:|---|
+| `num_experts` | 896（**每层独立**，非跨层共享） |
+| `num_experts_per_token` | 16 |
+| `num_shared_experts` | 2 |
+| `moe_layer_freq` | 1（每层都是 MoE） |
+| `moe_router_activation_func` | sigmoid |
+| `moe_renormalize` | True |
+| `topk_method` | noaux_tc |
+| `routed_scaling_factor` | 1.0 |
+
+### 1.3 Attention 配置
+
+| 参数 | 数值 |
+|---:|---|
+| `linear_attn_config.kda_layers` | **68 层** KDA（共 93 层） |
+| `linear_attn_config.full_attn_layers` | **24 层** MLA（全注意力层） |
+| `linear_attn_config.num_heads` | 96 |
+| `linear_attn_config.head_dim` | 128 |
+| `linear_attn_config.gate_lower_bound` | **-5.0**（confirmed!） |
+| `linear_attn_config.short_conv_kernel_size` | 4 |
+| `linear_attn_config.use_full_rank_gate` | True |
+| `attn_res_block_size` | 12 |
+| `mla_use_nope` | True |
+| `mla_use_output_gate` | True |
+
+### 1.4 量化配置（ModelScope 发布版）
+
+```
+format: mxfp4-pack-quantized (compressed-tensors)
+num_bits: 4 (weights only)
+group_size: 32
+symmetric: True
+忽略层: self_attn.*, shared_experts.*, mlp.(gate|up|gate_up|down)_proj.*, lm_head.*
+```
+
+> `lm_head`、`shared_experts`、`self_attn` 等层保持 BF16 精度。
+
+### 1.5 模型权重大小
+
+**ModelScope (`moonshotai/Kimi-K3`) 发布版 — MXFP4 量化后：**
+
+| 组件 | 文件数 | 说明 |
+|---|---|---|
+| 96 个 safetensors 分片 | 96 | 每个 0.09 ~ 16.99 GB |
+| 总权重大小 | **~1.56 TB** | BF16 等效存储（safetensors 存储 MXFP4-packed 数据） |
+
+> 实际 INT4 有效权重约 390-400 GB；safetensors 中 uint8 压缩存储 + scale 开销导致文件总大小高于有效参数数。
 
 ---
 
-## 二、显存估算
+## 二、显存估算（修正后）
 
-### 2.1 W4A8 量化下权重占用（per-expert）
+### 2.1 逐层权重分解（BF16 原始）
 
-| 权重矩阵 | Shape | INT4 大小 |
+| 组件 | 每层占用 | 合计 (93 层) |
 |---|---|---|
-| `gate_up_proj` | `[3584, 6144]` | ~11.0 MB |
-| `down_proj` | `[3072, 3584]` | ~5.5 MB |
-| **每个 Expert 合计** | | **~16.5 MB** |
+| **KDA Attention** (68 层，每层) | ~800 MB | ~54.4 GB |
+| Q/K/V 投影 | 88M × 3 = 264M params | |
+| Gate 投影 (f_a, f_b, b, g_a, g_b, o_proj) | ~200M params | |
+| Conv1D 权重 (kernel=4) | 极小 | |
+| **MLA Attention** (24 层，每层) | ~288 MB | ~6.9 GB |
+| q_a, q_b, kv_a, kv_b, o_proj | ~144M params | |
+| **MoE 专家** (93 层，每层 896 experts) | ~14.8 GB | **~1376 GB** |
+| 单个 expert: gate_up + down | ~66 MB (BF16) | |
+| **Router + 投影** (93 层) | ~130 MB | ~12.1 GB |
+| `routed_expert_down_proj` | 7168×3584 = 25.7M | |
+| `routed_expert_up_proj` | 3584×7168 = 25.7M | |
+| Router | 7168×896 = 6.4M | |
+| **Embedding + LM Head + Vision** | — | ~6 GB |
+| **其他 (RMSNorm, 共享专家…)** | — | ~10 GB |
+| **总计（BF16）** | | **~1.47 TB** ≈ 1.56 TB ✓ |
 
-### 2.2 无 EP 场景（全部 896 Expert 权重）
+### 2.2 W4A8 / MXFP4 量化后
 
-| 组件 | INT4 权重 |
+| 组件 | 量化后占用 |
 |---|---|
-| 896 Routed Experts | 896 × 16.5 MB ≈ 14.8 GB |
-| 2 Shared Experts | ~33 MB |
-| Attention 层 (KDA + MLA) × N | ~2-4 GB (取决于层数) |
-| Embedding + LM Head | ~0.5-1 GB |
-| Vision Tower (多模态) | ~0.5 GB |
-| **总权重大小** | **~18-22 GB** |
+| 量化层的 INT4 权重 (896 experts × 93 layers) | ~344 GB |
+| 非量化层 (self_attn, lm_head, shared_experts, mlp) BF16 | ~46 GB |
+| **总权重** | **~390 GB** |
 
-### 2.3 KV Cache / KDA State 占用
+### 2.3 单卡可行性分析
 
-| 组件 | 每 Token 占用 | 典型配置 | 总占用 |
-|---|---|---|---|
-| MLA KV Cache | ~0.02-0.05 MB/token | 8K context × 64 seqs | ~10-25 GB |
-| KDA Recurrent State | `[H, 128, 128]` × state_capacity | 1024 slots × 16 heads | ~0.01 GB (可忽略) |
+**以 Atlas 800T A2 (64 GB HBM) 为例：**
 
-### 2.4 单卡可行性（Atlas 800T A2, 64 GB HBM）
+```
+                   TP=8 (单节点)          TP=8 + EP=8 (64卡)      TP=8 + EP=64 (512卡)
+                   ─────────────          ─────────────────      ────────────────────
+量化权重 / 卡       390/8 = 48.8 GB       Expert: 344/8/8=5.4     Expert: 344/8/64=0.7
+                                         Attn: 46/8=5.8          Attn: 46/8=5.8
+                                         Total: ~11.2 GB         Total: ~6.5 GB
+KV Cache            5-10 GB              15-30 GB                30-50 GB
+激活 + 临时         2-5 GB               3-5 GB                  3-5 GB
+─────────────────────────────────────────────────────────────────────────────────
+合计                ~56-64 GB            ~30-46 GB               ~40-62 GB
+可行性              ⚠️ 临界               ✅ 舒适                  ✅ 舒适
+```
 
-| 组件 | 占用 |
-|---|---|
-| 权重 (W4A8, TP=8 切分) | ~2.5-3.5 GB |
-| KV Cache (8K × 32 seqs) | ~6-12 GB |
-| 激活值 + 临时显存 | ~5-10 GB |
-| CUDA Graph 缓存 | ~2-5 GB |
-| **合计** | **~15-30 GB** |
-
-> ✅ **单节点 (8×A2 64GB) 可部署 W4A8 量化版 Kimi K3（文本模式）。**
+> **结论：单节点 8×A2 (64GB) 部署 W4A8 Kimi K3 勉强可行但非常临界**。需严格控制 KV cache 和并发数，推荐开启 EP 以降低单卡内存压力。
 
 ---
 
 ## 三、推荐并行策略
 
-### 策略 A：单节点（最小资源）
+### 策略 A：单节点 TP=8（最小资源，临界）
 
 ```
-硬件: 1 节点 × 8 × Atlas 800T A2 (64 GB) 或 1 节点 × 8 × Atlas 800T A3 (64 GB)
-总卡数: 8
+硬件: 1 节点 × 8 × Atlas 800T A2/A3 (64 GB)
 ```
 
-| 并行维度 | 配置 | 说明 |
+| 并行维度 | 数值 | 说明 |
 |---|---|---|
-| **TP** | 8 | 按 attention head + expert 内部切分 |
-| **EP** | 不开启 | 896 个 expert 权重全量在每张卡上 |
-| **DP** | 不开启 | 单节点内不需要 |
+| TP | 8 | attention head 96 维正好被 8 整除 |
+| EP | 不开启 | 896 experts 全部在每张卡上 |
+| DP | 不开启 | |
 
 ```bash
-vllm serve <model-path> \
+vllm serve <w4a8-model-path> \
   --tensor-parallel-size 8 \
   --quantization ascend \
-  --max-model-len 8192 \
-  --max-num-seqs 32 \
-  --gpu-memory-utilization 0.9
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --gpu-memory-utilization 0.85 \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,32]}'
 ```
 
-| 限制项 | 值 |
+| 限制 | 说明 |
 |---|---|
-| 最大 Context 长度 | ~8K tokens (取决于并发请求数) |
-| 最大并发请求数 | ~32 (取决于 context 长度) |
-| 适用场景 | 文本对话、短文档处理、单轮 QA |
+| Context 长度 | ≤ 4K（KV cache 严格控制） |
+| 并发数 | ≤ 16 |
+| 适用场景 | 开发测试、短文本 QA |
 
-### 策略 B：双节点 DP（推荐生产环境）
-
-```
-硬件: 2 节点 × 8 × Atlas 800T A2/A3 (64 GB)
-总卡数: 16
-```
-
-| 并行维度 | 配置 | 说明 |
-|---|---|---|
-| **TP** | 8 | 单节点内 expert 内部切分 |
-| **DP** | 2 (跨节点) | 每节点独立服务请求，吞吐翻倍 |
-| **EP** | 不开启 | |
-| **DP Local** | 1 | |
-
-```bash
-# 节点 0 (主)
-vllm serve <model-path> \
-  --tensor-parallel-size 8 \
-  --data-parallel-size 2 \
-  --data-parallel-size-local 1 \
-  --data-parallel-start-rank 0 \
-  --data-parallel-address $LOCAL_IP \
-  --data-parallel-rpc-port 13389 \
-  --quantization ascend \
-  --max-model-len 32768 \
-  --max-num-seqs 64 \
-  --gpu-memory-utilization 0.9
-
-# 节点 1 (从)
-vllm serve <model-path> \
-  --tensor-parallel-size 8 \
-  --data-parallel-size 2 \
-  --data-parallel-size-local 1 \
-  --data-parallel-start-rank 1 \
-  --data-parallel-address $MASTER_IP \
-  --data-parallel-rpc-port 13389 \
-  --quantization ascend \
-  --max-model-len 32768 \
-  --headless \
-  --gpu-memory-utilization 0.9
-```
-
-> 参考：同仓库 Kimi-K2.5 部署配置 `tests/e2e/nightly/multi_node/internal_dp/config/Kimi-K2_5-W4A8-A2-dual-nodes.yaml`
-
-### 策略 C：多节点（EP 满配，最大吞吐）
+### 策略 B：TP=8 + EP=8（推荐最低生产配置）
 
 ```
 硬件: 8 节点 × 8 × Atlas 800T A2/A3 (64 GB)
 总卡数: 64
 ```
 
-| 并行维度 | 配置 | 说明 |
+| 并行维度 | 数值 | 说明 |
 |---|---|---|
-| **TP** | 8 | 单节点内 |
-| **EP** | 8 | 896/8=112 experts/rank，大幅降低单卡内存 |
-| **DP** | 1-8 | 取决于节点数 |
+| TP | 8 | 节点内 attention head 切分 |
+| EP | 8 | 896/8 = 112 experts/rank |
+| DP | 可叠加 | 视节点数而定 |
 
 ```bash
-vllm serve <model-path> \
+vllm serve <w4a8-model-path> \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
   --expert-parallel-size 8 \
   --quantization ascend \
-  --max-model-len 131072 \
-  --max-num-seqs 128 \
+  --max-model-len 32768 \
+  --max-num-seqs 64 \
   --gpu-memory-utilization 0.9
 ```
 
 | 优势 | 说明 |
 |---|---|
-| 支持长 Context | 可达 128K tokens |
-| 高并发 | 128+ 序列 |
-| 单卡显存压力小 | 每 rank 仅 ~112 experts (TP 切分后) |
+| Context 长度 | 可达 32K |
+| 并发数 | 64+ |
+| 单卡内存 | ~30-46 GB（舒适） |
 
-> **注意**: 策略 C 需要额外验证 Kimi K3 的 EP 算子（`dispatch_ffn_combine_*` 等）在目标平台上的可用性。
-
-### 策略 D：PD 分离 + Mooncake（最低延迟）
+### 策略 C：纯 DP 扩展（吞吐优先）
 
 ```
-硬件: P 节点 + D 节点，具体数量待验证
+硬件: 2×N 节点，TP=8，EP=8 per 8 nodes
+在每个 EP 组上叠加 DP
 ```
 
-| 角色 | 负责 | 最小卡数 |
+```bash
+# 8 节点 EP 组内
+--data-parallel-size 2 \
+--data-parallel-size-local 1
+```
+
+| 优势 | 说明 |
+|---|---|
+| 线性扩展吞吐 | 每增加 8 节点翻倍 |
+
+### 策略 D：EP=64（完整 Expert 并行，最低单卡内存）
+
+```
+硬件: 64 节点 × 8 × Atlas 800T A2/A3 (64 GB)
+总卡数: 512（但可搭配 TP 减少）
+```
+
+| 并行维度 | 数值 | 说明 |
 |---|---|---|
-| **Prefill (P)** | 长序列 prefill，chunk 并行 | 6-8 卡/节点 × N 节点 |
-| **Decode (D)** | 逐 token decode，recurrent 状态更新 | 2-4 卡/节点 × M 节点 |
+| TP | 1-8 | 可用较少 TP 换取更低的单卡内存 |
+| EP | 64 | 896/64 = 14 experts/rank |
 
-> **限制**: Kimi K3 当前暂不支持 PCP (`kimi_kda.py` line 317 有显式限制)，PD 分离策略需等待后续 PR 支持。
+> 512 卡是理论最大值（TP=1, EP=64, 64×8=512）。实际可调整 TP/EP/DP 组合。
 
 ---
 
-## 四、各平台适用策略
+## 四、训推精度对齐更新
 
-| 平台 | 推荐策略 | 单卡最小 | 说明 |
+### 关键发现：训练和推理使用的参数一致！
+
+从 HuggingFace config.json 证实：
+
+| 参数 | 训练 (MindSpeed-MM) | 推理 (vLLM-Ascend) | 对齐? |
 |---|---|---|---|
-| **A2 (910B, 64 GB)** | 策略 A 或 B | 8 卡 (1 节点) | ✅ 已验证可部署 |
-| **A2 (910B, 32 GB)** | 策略 C (EP=16+) | 待验证 | 32 GB 卡需要 EP 分担 expert 权重 |
-| **A3 (910_93, 64 GB)** | 策略 A 或 B + ModelSlim | 8 卡 (1 节点) | A3 有额外 MoE dispatch 融合算子 |
-| **A5 (950)** | 策略 A（situ_mx_quant） | 待验证 | A5 使用 MX FP8 量化，算子集不同 |
+| `gate_lower_bound` | **-5.0**（config 中声明） | **-5.0**（代码硬编码） | ✅ |
+| `activation_situ_beta` | **4.0** | **4.0** | ✅ |
+| `activation_situ_linear_beta` | **25.0** | **25.0** | ✅ |
+| `safe_gate` | True | True | ✅ |
+
+> 此前的「训推精度对齐分析」文档中关于 `gate_lower_bound` 未对齐的担忧已消除 — 训练 config 中确实声明了 `gate_lower_bound: -5.0`，训练和推理使用相同的 bounded sigmoid gate 公式。
+
+### 仍需关注的对齐点
+
+1. **SiTU 融合 kernel 内部精度** (`dequant_situ_quant` vs 训练侧 fp32 `SituAndMul`)
+2. **KDA Chunk 算子** (`triton_ascend_kernels` vs AscendC `chunk_kda_fwd` 的中间值差异)
+3. **量化误差** (MXFP4 权重 + INT8 激活 vs BF16 训练)
+
+---
+
+## 五、各平台适用性
+
+| 平台 | 推荐策略 | 最小卡数 | 说明 |
+|---|---|---|---|
+| **A2 (910B, 64 GB)** | 策略 B (TP=8+EP=8) | **64 卡** (8 节点) | 单节点 8 卡为临界配置 |
+| **A3 (910_93, 64 GB)** | 策略 B + A3 dispatch 融合 | 64 卡 | A3 有额外 MoE dispatch 融合算子 |
+| **A5 (950)** | 策略 B (situ_mx_quant) | 待验证 | 使用 MX FP8 量化 |
 | **310P** | ❌ 不支持 | — | 缺少 `recurrent_kda` 和 SiTU 量化算子 |
 
 ---
 
-## 五、环境变量
+## 六、参考命令
+
+### 环境变量
 
 ```bash
-# 通用
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_INTRA_PCIE_ENABLE=1
 export HCCL_INTRA_ROCE_ENABLE=0
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1
 export HCCL_BUFFSIZE=512
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+```
 
-# Kimi K3 专用
-export VLLM_ASCEND_ENABLE_MLAPO=1          # MLA 优化
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1     # Flash Communication
+### 最小测试启动命令
 
-# 量化（W4A8 权重必须）
---quantization ascend
+```bash
+# 单节点，TP=8，极简配置（仅验证功能可用）
+vllm serve <w4a8-model-path> \
+  --tensor-parallel-size 8 \
+  --quantization ascend \
+  --trust-remote-code \
+  --max-model-len 2048 \
+  --max-num-seqs 4 \
+  --gpu-memory-utilization 0.75 \
+  --disable-custom-all-reduce
 ```
 
 ---
 
-## 六、总结
+## 七、总结
 
-| 场景 | 最小硬件 | 最大 Context | 最大并发 |
+| 场景 | 最小硬件 | 最大 Context | 并行方案 |
 |---|---|---|---|
-| **开发/测试** | 1 节点 8×A2/A3 (64 GB) | 8K | 32 |
-| **生产（标准）** | 2 节点 16×A2/A3 (64 GB，DP=2) | 32K | 64 |
-| **生产（高吞吐）** | 8 节点 64×A2/A3 (64 GB，EP=8) | 128K | 128+ |
-| **训练** | （不在本文档范围内，MindSpeed-MM 项目负责） | — | — |
+| **功能验证** | 1 节点 8×A2/64GB | 2K | TP=8, 极保守配置 |
+| **开发测试** | 1 节点 8×A2/64GB | 4K | TP=8, 临界运行 |
+| **生产标准** | 8 节点 64×A2/64GB | 32K | TP=8 + EP=8 |
+| **大吞吐** | 16+ 节点 | 128K | TP=8 + EP=8 + DP=N |
+| **训练** | MindSpeed-MM 负责 | — | FSDP2 + EP + CP + SP |
 
-> **当前 PR 状态**: `feature/kimi-k3-release-v0.23.0` 为 OPEN 状态，以上部署策略基于代码分析，实际可用性需待 PR 合入并发布版本后验证。
+> **关键修正**：此前估计单节点 8×A2 可「舒适运行」是错误的。BF16 原始模型 1.56 TB、W4A8 量化后 ~390 GB 权重，TP=8 下每卡权重约 49 GB，加上 KV cache 后几乎填满 64 GB。**强烈建议生产环境开启 EP**。
