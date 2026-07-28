@@ -1,7 +1,7 @@
 # Kimi K3 部署并行策略与资源估算
 
 > 分析日期: 2026-07-28
-> 数据来源: ModelScope `moonshotai/Kimi-K3` config.json + HuggingFace 权重仓库
+> 数据来源: HuggingFace `moonshotai/Kimi-K3` + ModelScope `moonshotai/Kimi-K3`
 > **目标硬件: A2 (Ascend 910B), 64 GB HBM/卡**
 
 ---
@@ -17,174 +17,137 @@
 | 非 Expert 参数量 | ~0.18T（attention/embedding/shared/norm） |
 | 纯 BF16 总大小 | ~5560 GB (2.78T × 2 bytes) |
 
-### 1.2 HuggingFace 两个仓库
+### 1.2 发布仓库
 
-| 仓库 | 大小 | 格式 |
-|---|---|---|
-| `moonshotai/Kimi-K3` | 1560 GB | **混合精度**: Expert MXFP4 (~1300 GB) + 非Expert BF16 (~260 GB) |
-| `moonshotai/Kimi-K3-MXFP4` | 594 GB | **全量 MXFP4**: 所有权重 4-bit 存储 |
+Moonshot AI 团队在训练时使用 MXFP4/MXFP8 混合精度原生训练，发布的 checkpoint 直接就是训练精度：
 
-### 1.3 A2 上的部署约束
+| 仓库 | 平台 | 大小 | 格式 |
+|---|---|---|---|
+| `moonshotai/Kimi-K3` | HuggingFace | **1560 GB** | 混合精度: Expert MXFP4 (~1300 GB) + 非Expert BF16 (~260 GB) |
+| `moonshotai/Kimi-K3` | ModelScope | **1560 GB** | 同上 |
 
-A2 **不支持 MXFP4 原生计算**。与 A5 不同，A2 无法直接在 MXFP4 格式上做矩阵乘。A2 的 NPU 指令集支持：BF16、FP16、FP32、INT8、INT4。
+> **只有一个仓库，不存在独立的 MXFP4 全量量化版本。** 之前的分析中假设存在 `Kimi-K3-MXFP4` (594 GB) 是错误的。
+
+### 1.3 非 Expert BF16 部分详解
+
+量化配置中明确排除了以下模块的量化（保持 BF16）：
+
+```
+ignore: ['re:.*self_attn.*', 're:.*shared_experts.*', 're:.*mlp\\.(gate|up|gate_up|down)_proj.*', 're:.*lm_head.*']
+```
+
+| 组件 | 层数 | 说明 | 估计 BF16 大小 |
+|---|---|---|---|
+| KDA Attention (q/k/v/o_proj, gate proj) | 68 层 | 含 full_rank_gate 输出投影 | ~100 GB |
+| MLA Attention (q_a/q_b/kv_a/kv_b/o_proj) | 24 层 | 低秩压缩 | ~40 GB |
+| Shared Experts (gate_up + down, ×2) | 93 层 | 每层 2 个共享专家 | ~20 GB |
+| Embedding (163840 × 7168) | 1 | | ~2.3 GB |
+| LM Head (7168 × 163840) | 1 | | ~2.3 GB |
+| RMSNorm + Router gates + 其他 | 93 层 | | ~95 GB |
+| **合计** | | | **~260 GB** |
+
+> 这 ~260 GB BF16 权重不受 EP 切分影响——EP 只切 Expert，不切 attention/embedding/shared/norm。
+
+### 1.4 A2 上的计算约束
+
+A2 **不支持 MXFP4 原生计算**（MXFP4 需要 A5 硬件）。A2 指令集支持：BF16、FP16、FP32、INT8、INT4。
 
 在 A2 上部署时：
-- MXFP4 权重→**HBM 中以 MXFP4 格式存储**（节省存储空间）
-- 计算时 GMM/W4A8 路径**即时反量化**为 BF16 → 乘加 → 输出
-- 反量化是计算的一部分，不额外占用 HBM（中间结果在 L1/UB 中）
-- **HBM 中存储的格式决定显存占用，不是计算格式**
-
-### 1.4 核心超参
-
-| 参数 | 数值 |
-|---:|---:|
-| `num_hidden_layers` | 93 (68 KDA + 24 MLA) |
-| `hidden_size` | 7168 |
-| `num_attention_heads` | 96 |
-| `num_experts` | 896（每层独立） |
-| `num_experts_per_token` | 16 |
-| `gate_lower_bound` | -5.0 |
-| SiTU `beta`/`linear_beta` | 4.0/25.0 |
+- Expert MXFP4 权重 → HBM 中以 MXFP4-packed 格式存储
+- GMM（Grouped MatMul）计算时即时反量化 MXFP4 → BF16
+- 反量化发生在计算单元内部，不额外占用 HBM
+- SiTU 激活通过 `dequant_situ_quant` 融合 → 输出 INT8
 
 ---
 
-## 二、A2 单卡显存估算
+## 二、A2 (64 GB) 显存估算
 
-### 2.1 使用 `moonshotai/Kimi-K3`（混合精度仓库, 1560 GB）
-
-```
-Expert (MXFP4-packed):      ~1300 GB
-非Expert (BF16):            ~260 GB  ← attention/embedding/shared/norm/norm 等
-加载总大小 (HBM):           ~1560 GB
-```
-
-| TP | EP | 卡数 | Expert GB/卡 | 非Expert GB/卡 | 权重合计 | KV Cache | 总计 | 可行性 |
-|:---:|:---:|:---:|---:|---:|---:|---:|---:|:---:|
-| 8 | 1 | 8 | 162.5 | 32.5 | **195.0** | — | >195 | ❌ |
-| 8 | 8 | 64 | 20.3 | 32.5 | **52.8** | 5-10 | ~62 | ⚠️ 临界 |
-| 8 | 16 | 128 | 10.2 | 32.5 | **42.7** | 10-15 | ~55 | ✅ |
-| 8 | 32 | 256 | 5.1 | 32.5 | **37.6** | 15-25 | ~55 | ✅ |
-
-> 瓶颈在**非Expert BF16 权重**（260 GB / TP=8 = 32.5 GB/卡），这部分**不受 EP 影响**——attention/embedding/shared/norm 不通过 EP 切分。
-
-### 2.2 使用 `moonshotai/Kimi-K3-MXFP4`（全量 MXFP4, 594 GB）⭐ 推荐
+### 2.1 权重占用
 
 ```
-Expert (MXFP4):              ~552 GB (93%)
-非Expert (MXFP4):            ~42 GB  (7%)
-加载总大小 (HBM):            ~594 GB
+Expert (MXFP4-packed):  ~1300 GB ← EP 可切分
+非Expert (BF16):        ~260 GB  ← EP 不可切分，仅 TP 可切
+加载总大小:             ~1560 GB
 ```
 
-| TP | EP | 卡数 | Expert GB/卡 | 非Expert GB/卡 | 权重合计 | KV Cache | 总计 | 可行性 |
-|:---:|:---:|:---:|---:|---:|---:|---:|---:|:---:|
-| 8 | 1 | 8 | 69.0 | 5.3 | **74.3** | — | >74 | ❌ |
-| 8 | 8 | 64 | 8.6 | 5.3 | **13.9** | 10-20 | ~30 | ✅ |
-| 8 | 4 | 32 | 17.3 | 5.3 | **22.6** | 10-20 | ~40 | ✅ |
-| 8 | 2 | 16 | 34.5 | 5.3 | **39.8** | 10-15 | ~55 | ✅ |
-| 4 | 8 | 32 | 17.3 | 10.5 | **27.8** | 10-20 | ~45 | ✅ |
-| 4 | 4 | 16 | 34.5 | 10.5 | **45.0** | 10-15 | ~60 | ⚠️ 临界 |
+### 2.2 各方案每卡显存
 
-> **推荐 TP=8, EP=4, 32 卡 (4 节点)**。每卡 ~23 GB 权重 + ~15 GB KV cache = ~38 GB，余量充足。
+| TP | EP | 卡数 | Expert GB/卡 | 非Expert GB/卡 | 权重合计 | +KV Cache | +激活 | **总占用** | 可行性 |
+|:---:|:---:|:---:|---:|---:|---:|---:|---:|---:|:---:|
+| 8 | — | 8 | 162.5 | 32.5 | 195.0 | — | — | **>195** | ❌ |
+| 8 | 8 | 64 | 20.3 | 32.5 | 52.8 | 5-10 | 2-3 | **~63** | ⚠️ 临界 |
+| 8 | 16 | 128 | 10.2 | 32.5 | 42.7 | 10-15 | 2-3 | **~57** | ✅ |
+| 8 | 32 | 256 | 5.1 | 32.5 | 37.6 | 15-25 | 2-3 | **~60** | ✅ |
+| 4 | 32 | 128 | 10.2 | 65.0 | 75.2 | — | — | **>75** | ❌ |
+| 4 | 64 | 256 | 5.1 | 65.0 | 70.1 | — | — | **>70** | ❌ |
 
-### 2.3 两个仓库对比
+> **关键发现**: TP=4 不可行——非Expert BF16 每卡 65 GB 已超单卡容量。**必须 TP≥8，且必须 EP≥16**。
+>
+> 瓶颈始终是**非Expert BF16 权重**（260 GB），这部分不受 EP 影响。TP=8 时每卡固定 32.5 GB，占总 HBM 的一半。
 
-| | 混合精度仓库 (1560 GB) | MXFP4 仓库 (594 GB) |
-|---|---|---|
-| 非Expert 格式 | BF16 → **A2 可直接计算** | MXFP4 → **需反量化，但 HBM 占用小** |
-| TP=8 下非Expert/卡 | 32.5 GB | 5.3 GB |
-| 最小可行配置 | 128 卡 (TP=8, EP=16) | **32 卡 (TP=8, EP=4)** |
-| 推荐场景 | A5（原生 MXFP4 计算）/ 已有权重 | **A2 部署首选** |
+### 2.3 最小可行配置
 
-> **在 A2 上，MXFP4 仓库是更好的选择**。虽然 A2 不能原生计算 MXFP4，但 GMM 反量化路径已经处理了这个问题。关键是 HBM 存储——594 GB vs 1560 GB，非Expert 部分缩小了 6 倍。
+```
+TP=8 + EP=16:  128 卡 (16 节点) ≈ 57 GB/卡  ✅ 推荐
+TP=8 + EP=8:    64 卡 (8 节点)  ≈ 63 GB/卡  ⚠️ 临界，需严格限制 KV cache
+```
 
 ---
 
-## 三、推荐部署方案
+## 三、推荐部署命令
 
-### 方案 A：MXFP4 仓库 + TP=8 + EP=4（推荐）
-
-```
-硬件: 4 节点 × 8 × A2 (64 GB) = 32 卡
-仓库: moonshotai/Kimi-K3-MXFP4 (594 GB)
-```
+### 生产配置（128 卡，16 节点）
 
 ```bash
-vllm serve moonshotai/Kimi-K3-MXFP4 \
+vllm serve moonshotai/Kimi-K3 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
-  --expert-parallel-size 4 \
+  --expert-parallel-size 16 \
   --quantization ascend \
   --trust-remote-code \
-  --max-model-len 16384 \
-  --max-num-seqs 32 \
+  --max-model-len 32768 \
+  --max-num-seqs 64 \
   --gpu-memory-utilization 0.85
 ```
 
-| 指标 | 数值 |
-|---|---|
-| 权重/卡 | ~23 GB |
-| KV Cache 余量 | ~15-20 GB (16K × 32 seqs) |
-| 激活+其他余量 | ~15-20 GB |
-
-### 方案 B：MXFP4 仓库 + TP=8 + EP=2（最小卡数）
-
-```
-硬件: 2 节点 × 8 × A2 (64 GB) = 16 卡
-```
+### 临界配置（64 卡，8 节点）
 
 ```bash
-vllm serve moonshotai/Kimi-K3-MXFP4 \
+vllm serve moonshotai/Kimi-K3 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
-  --expert-parallel-size 2 \
+  --expert-parallel-size 8 \
   --quantization ascend \
   --trust-remote-code \
-  --max-model-len 8192 \
+  --max-model-len 4096 \
   --max-num-seqs 16 \
-  --gpu-memory-utilization 0.85
+  --gpu-memory-utilization 0.80
 ```
-
-| 指标 | 数值 |
-|---|---|
-| 权重/卡 | ~40 GB |
-| KV Cache 余量 | ~8-12 GB (8K × 16 seqs) |
-| 可行性 | ⚠️ 临界，需严格控制 context 和并发 |
-
-### 方案 C：混合精度仓库 + TP=8 + EP=16（大容量）
-
-```
-硬件: 16 节点 × 8 × A2 (64 GB) = 128 卡
-仓库: moonshotai/Kimi-K3 (1560 GB)
-```
-
-适用于已有混合精度权重、不愿重新下载的场景。
 
 ---
 
-## 四、方案可行性速查
+## 四、各平台对比
 
-```
-仓库: moonshotai/Kimi-K3-MXFP4 (594 GB) [推荐]
-
-TP=8 + EP=4:  32 卡 ✅  权重 23 GB + KV ~15 GB = ~38 GB
-TP=8 + EP=2:  16 卡 ⚠️  权重 40 GB + KV ~10 GB = ~50 GB (临界)
-TP=4 + EP=8:  32 卡 ✅  权重 28 GB + KV ~15 GB = ~43 GB
-
-仓库: moonshotai/Kimi-K3 (1560 GB, 混合精度)
-
-TP=8 + EP=16: 128 卡 ✅  权重 43 GB + KV ~15 GB = ~58 GB
-TP=8 + EP=8:   64 卡 ⚠️  权重 53 GB + KV ~10 GB = ~63 GB (临界)
-TP=8 + EP=4:   32 卡 ❌  权重 73 GB 单权重已超 64 GB
-```
+| 平台 | 推荐方案 | 最小卡数 | 说明 |
+|---|---|---|---|
+| **A2 (910B, 64 GB)** | TP=8 + EP=16 | **128 卡** | 非Expert BF16 为瓶颈 |
+| A3 (910_93, 64 GB) | TP=8 + EP=16 | 128 卡 | 同 A2，有 dispatch 融合优化 |
+| **A5 (950)** | TP=8 + EP=4 或更少 | **待验证, 预计 32-64 卡** | MXFP4 原生计算 + `situ_mx_quant`，减少反量化开销 |
+| 310P | ❌ 不支持 | — | 缺少关键算子 |
 
 ---
 
 ## 五、总结
 
-| 场景 | 仓库 | 最小硬件 | 并行方案 |
-|---|---|---|---|
-| **推荐部署** | MXFP4 (594 GB) | **32 卡 (4 节点)** | TP=8, EP=4 |
-| 最小验证 | MXFP4 (594 GB) | 16 卡 (2 节点) | TP=8, EP=2, 界限配置 |
-| 兼容部署 | 混合精度 (1560 GB) | 128 卡 (16 节点) | TP=8, EP=16 |
+```
+Kimi K3 部署约束:
+  Expert MXFP4 (~1300 GB) → EP 可切分 → 不是瓶颈
+  非Expert BF16 (~260 GB) → EP 不可切 → TP=8 下每卡固定 32.5 GB
+  64 GB HBM  → 权重占用 32.5 + Expert 分片 + KV cache < 64 GB
+           → EP≥16 时 Expert 分片 ≤ 10.2 GB/卡
+           → 总占用 ≈ 57 GB/卡 ✅
 
-> **关键结论**: A2 上用 MXFP4 仓库 (594 GB) 比混合精度仓库 (1560 GB) 显存节省 2.6 倍，32 卡即可部署。瓶颈不在 Expert 权重（EP 可切分），而在于**非Expert 权重的 HBM 存储**——混合精度仓库中这部分用 BF16 存储占 260 GB，TP=8 下每卡固定 32.5 GB；MXFP4 仓库中仅 42 GB，TP=8 下每卡仅 5.3 GB。
+  A2 最小生产：128 卡 (TP=8 + EP=16)
+  临界验证：   64 卡 (TP=8 + EP=8, 极严格 KV cache 限制)
+  单节点：     不可行（195 GB/卡）
+```
